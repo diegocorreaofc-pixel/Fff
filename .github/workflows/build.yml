@@ -1,1 +1,513 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Criar projeto
+        run: |
+          mkdir -p MeuDia MeuDia/app MeuDia/app/src/main MeuDia/app/src/main/java/com/meuapp/anotacoes MeuDia/app/src/main/res/values MeuDia/gradle/wrapper
+          cat > MeuDia/app/build.gradle.kts <<'END_OF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.meuapp.anotacoes"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.meuapp.anotacoes"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug") // assina com chave debug: APK instalável direto
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          END_OF_FILE
+          cat > MeuDia/app/src/main/AndroidManifest.xml <<'END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.App">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".AlarmReceiver" android:exported="false" />
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          END_OF_FILE
+          cat > MeuDia/app/src/main/java/com/meuapp/anotacoes/MainActivity.kt <<'END_OF_FILE'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.meuapp.anotacoes
+
+          import android.Manifest
+          import android.app.TimePickerDialog
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalView
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextDecoration
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme { App() } }
+              }
+          }
+
+          @Composable
+          fun App() {
+              val ctx = LocalContext.current
+              val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+                  Scheduler.scheduleAll(ctx)
+              }
+              LaunchedEffect(Unit) {
+                  if (Build.VERSION.SDK_INT >= 33) launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  Scheduler.scheduleAll(ctx)
+              }
+              var tab by remember { mutableIntStateOf(0) }
+              val titles = listOf("Notas", "Recados", "Lembretes", "Meditar")
+              val icons = listOf("📝", "📌", "⏰", "🧘")
+              Scaffold(
+                  topBar = { TopAppBar(title = { Text("Meu Dia") }) },
+                  bottomBar = {
+                      NavigationBar {
+                          titles.forEachIndexed { i, t ->
+                              NavigationBarItem(
+                                  selected = tab == i, onClick = { tab = i },
+                                  icon = { Text(icons[i], fontSize = 20.sp) }, label = { Text(t) }
+                              )
+                          }
+                      }
+                  }
+              ) { pad ->
+                  Box(Modifier.padding(pad).fillMaxSize()) {
+                      when (tab) {
+                          0 -> NotesScreen("nota")
+                          1 -> NotesScreen("recado")
+                          2 -> RemindersScreen()
+                          else -> MeditationScreen()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun NotesScreen(kind: String) {
+              val ctx = LocalContext.current
+              var all by remember { mutableStateOf(Store.loadNotes(ctx)) }
+              var text by remember { mutableStateOf("") }
+              fun save(l: List<Note>) { all = l; Store.saveNotes(ctx, l) }
+              val list = all.filter { it.kind == kind }
+              Column(Modifier.fillMaxSize().padding(12.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      OutlinedTextField(
+                          value = text, onValueChange = { text = it }, modifier = Modifier.weight(1f),
+                          label = { Text(if (kind == "nota") "Nova nota" else "Novo recado") }
+                      )
+                      Spacer(Modifier.width(8.dp))
+                      Button(onClick = {
+                          if (text.isNotBlank()) { save(all + Note(System.currentTimeMillis(), kind, text.trim())); text = "" }
+                      }) { Text("+") }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  LazyColumn {
+                      items(list, key = { it.id }) { n ->
+                          Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                              Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  if (kind == "recado") Checkbox(n.done, { v ->
+                                      save(all.map { x -> if (x.id == n.id) x.copy(done = v) else x })
+                                  })
+                                  Text(
+                                      n.text, Modifier.weight(1f),
+                                      textDecoration = if (n.done) TextDecoration.LineThrough else null
+                                  )
+                                  TextButton({ save(all.filter { x -> x.id != n.id }) }) { Text("✕") }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun RemindersScreen() {
+              val ctx = LocalContext.current
+              var list by remember { mutableStateOf(Store.loadReminders(ctx)) }
+              var text by remember { mutableStateOf("") }
+              var hour by remember { mutableIntStateOf(9) }
+              var minute by remember { mutableIntStateOf(0) }
+              var hourly by remember { mutableStateOf(Store.hourly(ctx)) }
+              var interval by remember { mutableIntStateOf(Store.interval(ctx)) }
+              Column(Modifier.fillMaxSize().padding(12.dp)) {
+                  Card(Modifier.fillMaxWidth()) {
+                      Column(Modifier.padding(12.dp)) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text("Avisar ao longo do dia (8h–21h)", Modifier.weight(1f))
+                              Switch(hourly, { v ->
+                                  hourly = v; Store.setHourly(ctx, v); Scheduler.scheduleAll(ctx)
+                              })
+                          }
+                          if (hourly) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Text("A cada")
+                              listOf(1, 2, 3, 4).forEach { h ->
+                                  FilterChip(
+                                      selected = interval == h,
+                                      onClick = { interval = h; Store.setInterval(ctx, h); Scheduler.scheduleAll(ctx) },
+                                      label = { Text("${h}h") }
+                                  )
+                              }
+                          }
+                      }
+                  }
+                  Spacer(Modifier.height(12.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      OutlinedTextField(text, { text = it }, Modifier.weight(1f), label = { Text("Novo lembrete (diário)") })
+                      OutlinedButton(onClick = {
+                          TimePickerDialog(ctx, { _, h, m -> hour = h; minute = m }, hour, minute, true).show()
+                      }) { Text("%02d:%02d".format(hour, minute)) }
+                      Button(onClick = {
+                          if (text.isNotBlank()) {
+                              val r = Reminder((System.currentTimeMillis() % 1_000_000).toInt() + 100, text.trim(), hour, minute)
+                              list = list + r; Store.saveReminders(ctx, list); Scheduler.scheduleAll(ctx); text = ""
+                          }
+                      }) { Text("+") }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  LazyColumn {
+                      items(list, key = { it.id }) { r ->
+                          Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                              Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  Text("%02d:%02d".format(r.hour, r.minute), fontWeight = FontWeight.Bold)
+                                  Spacer(Modifier.width(12.dp))
+                                  Text(r.text, Modifier.weight(1f))
+                                  TextButton({
+                                      Scheduler.cancelReminder(ctx, r.id)
+                                      list = list.filter { x -> x.id != r.id }; Store.saveReminders(ctx, list)
+                                  }) { Text("✕") }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun MeditationScreen() {
+              val ctx = LocalContext.current
+              var minutes by remember { mutableIntStateOf(10) }
+              var remaining by remember { mutableLongStateOf(10 * 60_000L) }
+              var endAt by remember { mutableLongStateOf(0L) }
+              var running by remember { mutableStateOf(false) }
+              val view = LocalView.current
+              DisposableEffect(running) {
+                  view.keepScreenOn = running
+                  onDispose { view.keepScreenOn = false }
+              }
+              LaunchedEffect(running) {
+                  while (running) {
+                      remaining = (endAt - System.currentTimeMillis()).coerceAtLeast(0)
+                      if (remaining == 0L) running = false
+                      delay(250)
+                  }
+              }
+              val s = (remaining + 999) / 1000
+              Column(
+                  Modifier.fillMaxSize().padding(16.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
+              ) {
+                  Text("%02d:%02d".format(s / 60, s % 60), fontSize = 72.sp, fontWeight = FontWeight.Light, textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(16.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      listOf(5, 10, 15, 20, 30).forEach { m ->
+                          FilterChip(
+                              selected = minutes == m, enabled = !running,
+                              onClick = { minutes = m; remaining = m * 60_000L },
+                              label = { Text("$m") }
+                          )
+                      }
+                  }
+                  Text("minutos")
+                  Spacer(Modifier.height(24.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      if (running) Button(onClick = {
+                          remaining = (endAt - System.currentTimeMillis()).coerceAtLeast(0)
+                          running = false; Scheduler.cancelMeditation(ctx)
+                      }) { Text("Pausar") }
+                      else Button(enabled = remaining > 0, onClick = {
+                          endAt = System.currentTimeMillis() + remaining
+                          running = true; Scheduler.scheduleMeditation(ctx, endAt)
+                      }) { Text("Iniciar") }
+                      OutlinedButton(onClick = {
+                          running = false; Scheduler.cancelMeditation(ctx); remaining = minutes * 60_000L
+                      }) { Text("Zerar") }
+                  }
+              }
+          }
+          END_OF_FILE
+          cat > MeuDia/app/src/main/java/com/meuapp/anotacoes/Reminders.kt <<'END_OF_FILE'
+          package com.meuapp.anotacoes
+
+          import android.Manifest
+          import android.app.AlarmManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import java.util.Calendar
+
+          object Notifier {
+              private const val CHANNEL = "avisos"
+
+              fun show(c: Context, id: Int, title: String, text: String) {
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      c.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) return
+                  val nm = c.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CHANNEL, "Avisos", NotificationManager.IMPORTANCE_HIGH))
+                  val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(c, CHANNEL)
+                      .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setStyle(Notification.BigTextStyle().bigText(text))
+                      .setContentIntent(open)
+                      .setAutoCancel(true)
+                      .build()
+                  nm.notify(id, n)
+              }
+          }
+
+          object Scheduler {
+              private fun pi(c: Context, code: Int, kind: String, text: String = ""): PendingIntent {
+                  val i = Intent(c, AlarmReceiver::class.java).putExtra("kind", kind).putExtra("text", text)
+                  return PendingIntent.getBroadcast(c, code, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+              }
+
+              private fun set(c: Context, at: Long, p: PendingIntent) {
+                  val am = c.getSystemService(AlarmManager::class.java)
+                  if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms())
+                      am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+                  else
+                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+              }
+
+              private fun at(hour: Int, minute: Int, dayOffset: Int = 0): Long =
+                  Calendar.getInstance().apply {
+                      add(Calendar.DAY_OF_YEAR, dayOffset)
+                      set(Calendar.HOUR_OF_DAY, hour); set(Calendar.MINUTE, minute)
+                      set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                  }.timeInMillis
+
+              private fun nextDaily(hour: Int, minute: Int): Long {
+                  val t = at(hour, minute)
+                  return if (t <= System.currentTimeMillis()) at(hour, minute, 1) else t
+              }
+
+              private fun nextSlot(step: Int): Long {
+                  val now = System.currentTimeMillis()
+                  var h = 8
+                  while (h <= 21) {
+                      val t = at(h, 0)
+                      if (t > now) return t
+                      h += step
+                  }
+                  return at(8, 0, 1)
+              }
+
+              fun scheduleAll(c: Context) {
+                  Store.loadReminders(c).forEach { set(c, nextDaily(it.hour, it.minute), pi(c, it.id, "reminder", it.text)) }
+                  if (Store.hourly(c)) set(c, nextSlot(Store.interval(c)), pi(c, 1, "hourly"))
+                  else c.getSystemService(AlarmManager::class.java).cancel(pi(c, 1, "hourly"))
+              }
+
+              fun cancelReminder(c: Context, id: Int) =
+                  c.getSystemService(AlarmManager::class.java).cancel(pi(c, id, "reminder"))
+
+              fun scheduleMeditation(c: Context, at: Long) = set(c, at, pi(c, 2, "med"))
+              fun cancelMeditation(c: Context) =
+                  c.getSystemService(AlarmManager::class.java).cancel(pi(c, 2, "med"))
+          }
+
+          class AlarmReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  when (i.getStringExtra("kind")) {
+                      "reminder" -> Notifier.show(
+                          c, (System.currentTimeMillis() % 100000).toInt() + 1000,
+                          "Lembrete", i.getStringExtra("text") ?: ""
+                      )
+                      "hourly" -> {
+                          val p = Store.loadNotes(c).filter { it.kind == "recado" && !it.done }
+                          val msg = if (p.isEmpty()) "Nenhum recado pendente. Respire fundo e siga o dia!"
+                          else "${p.size} pendente(s): " + p.take(3).joinToString(" • ") { it.text }
+                          Notifier.show(c, 1, "Recados do dia", msg)
+                      }
+                      "med" -> {
+                          Notifier.show(c, 2, "Meditação", "Sessão concluída 🧘")
+                          c.getSystemService(Vibrator::class.java)
+                              ?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 500, 200, 500, 200, 800), -1))
+                      }
+                  }
+                  Scheduler.scheduleAll(c)
+              }
+          }
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) = Scheduler.scheduleAll(c)
+          }
+          END_OF_FILE
+          cat > MeuDia/app/src/main/java/com/meuapp/anotacoes/Store.kt <<'END_OF_FILE'
+          package com.meuapp.anotacoes
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          data class Note(val id: Long, val kind: String, val text: String, val done: Boolean = false)
+          data class Reminder(val id: Int, val text: String, val hour: Int, val minute: Int)
+
+          object Store {
+              private fun p(c: Context) = c.getSharedPreferences("data", Context.MODE_PRIVATE)
+
+              fun loadNotes(c: Context): List<Note> {
+                  val a = JSONArray(p(c).getString("notes", "[]"))
+                  return (0 until a.length()).map {
+                      val o = a.getJSONObject(it)
+                      Note(o.getLong("id"), o.getString("kind"), o.getString("text"), o.optBoolean("done"))
+                  }
+              }
+
+              fun saveNotes(c: Context, l: List<Note>) {
+                  val a = JSONArray()
+                  l.forEach { a.put(JSONObject().put("id", it.id).put("kind", it.kind).put("text", it.text).put("done", it.done)) }
+                  p(c).edit().putString("notes", a.toString()).apply()
+              }
+
+              fun loadReminders(c: Context): List<Reminder> {
+                  val a = JSONArray(p(c).getString("reminders", "[]"))
+                  return (0 until a.length()).map {
+                      val o = a.getJSONObject(it)
+                      Reminder(o.getInt("id"), o.getString("text"), o.getInt("hour"), o.getInt("minute"))
+                  }
+              }
+
+              fun saveReminders(c: Context, l: List<Reminder>) {
+                  val a = JSONArray()
+                  l.forEach { a.put(JSONObject().put("id", it.id).put("text", it.text).put("hour", it.hour).put("minute", it.minute)) }
+                  p(c).edit().putString("reminders", a.toString()).apply()
+              }
+
+              fun hourly(c: Context) = p(c).getBoolean("hourly", false)
+              fun setHourly(c: Context, v: Boolean) = p(c).edit().putBoolean("hourly", v).apply()
+              fun interval(c: Context) = p(c).getInt("interval", 2)
+              fun setInterval(c: Context, v: Int) = p(c).edit().putInt("interval", v).apply()
+          }
+          END_OF_FILE
+          cat > MeuDia/app/src/main/res/values/strings.xml <<'END_OF_FILE'
+          <resources><string name="app_name">Meu Dia</string></resources>
+          END_OF_FILE
+          cat > MeuDia/app/src/main/res/values/themes.xml <<'END_OF_FILE'
+          <resources><style name="Theme.App" parent="android:Theme.Material.Light.NoActionBar" /></resources>
+          END_OF_FILE
+          cat > MeuDia/build.gradle.kts <<'END_OF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          END_OF_FILE
+          cat > MeuDia/gradle.properties <<'END_OF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          END_OF_FILE
+          cat > MeuDia/gradle/wrapper/gradle-wrapper.properties <<'END_OF_FILE'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          END_OF_FILE
+          cat > MeuDia/settings.gradle.kts <<'END_OF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MeuDia"
+          include(":app")
+          END_OF_FILE
+      - name: Compilar APK
+        run: cd MeuDia && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeuDia-apk
+          path: MeuDia/app/build/outputs/apk/debug/app-debug.apk
 
